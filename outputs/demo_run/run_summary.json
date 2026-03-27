@@ -1,0 +1,24 @@
+{
+  "config_path": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/configs/demo_config.json",
+  "input_dir": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/demo_data",
+  "output_dir": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/outputs/demo_run",
+  "sampling_rate_hz": 12000,
+  "segment_length": 2048,
+  "segment_overlap": 0.5,
+  "fault_frequencies_hz": {
+    "BPFI": 162.0,
+    "BPFO": 108.0,
+    "BSF": 72.0,
+    "FTF": 12.0
+  },
+  "num_rows": 88,
+  "labels": [
+    "ball",
+    "healthy",
+    "inner",
+    "outer"
+  ],
+  "num_time_features": 14,
+  "num_frequency_features": 36,
+  "has_missing_values": false
+}
