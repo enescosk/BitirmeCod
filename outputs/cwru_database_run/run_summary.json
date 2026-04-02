@@ -1,0 +1,35 @@
+{
+  "config_path": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/configs/cwru_database_config.json",
+  "input_dir": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/data/cwru_database_20260329",
+  "output_dir": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/outputs/cwru_database_run",
+  "sampling_rate_hz": 12000,
+  "segment_length": 2048,
+  "segment_overlap": 0.5,
+  "fault_frequencies_hz": {
+    "BPFI": 162.19,
+    "BPFO": 107.36,
+    "BSF": 141.17,
+    "FTF": 11.93
+  },
+  "num_rows": 2350,
+  "labels": [
+    "ball",
+    "healthy",
+    "inner",
+    "outer"
+  ],
+  "num_time_features": 14,
+  "num_frequency_features": 46,
+  "num_time_frequency_features": 12,
+  "has_missing_values": false,
+  "output_fault_status_counts": {
+    "FAULT": 2113,
+    "NO_FAULT": 237
+  },
+  "output_fault_location_counts": {
+    "BALL": 1878,
+    "NONE": 237,
+    "OUTER_RACE": 118,
+    "INNER_RACE": 117
+  }
+}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -22,7 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.io import loadmat, wavfile
-from scipy.signal import hilbert
+from scipy.signal import find_peaks, hilbert, stft, welch
 from scipy.stats import kurtosis, skew
 
 
@@ -34,6 +35,7 @@ class SignalRecord:
     path: Path
     label: str
     signal: np.ndarray
+    source_metadata: dict[str, object]
 
 
 def load_config(path: Path) -> dict:
@@ -48,11 +50,13 @@ def load_config(path: Path) -> dict:
     config.setdefault("signal_column", None)
     config.setdefault("harmonics", 3)
     config.setdefault("fault_band_half_width_hz", 5.0)
-    config.setdefault(
-        "band_energy_hz",
-        [[0.0, 500.0], [500.0, 1500.0], [1500.0, 3000.0]],
-    )
+    config.setdefault("band_energy_hz", [[0.0, 500.0], [500.0, 2000.0], [2000.0, None]])
     config.setdefault("max_plots_per_label", 1)
+    config.setdefault("save_stft_artifacts", True)
+    config.setdefault("max_stft_artifacts_per_file", 1)
+    config.setdefault("stft_nperseg", 256)
+    config.setdefault("stft_noverlap", 128)
+    config.setdefault("welch_nperseg", 1024)
     return config
 
 
@@ -79,47 +83,54 @@ def first_numeric_series(frame: pd.DataFrame, requested_column: str | None) -> n
     return normalize_signal(numeric.iloc[:, 0].to_numpy())
 
 
-def load_signal(path: Path, signal_column: str | None) -> np.ndarray:
+def pick_mat_signal_key(data: dict[str, object]) -> str | None:
+    priorities = ["de_time", "fe_time", "ba_time", "signal", "vibration", "data", "x"]
+    visible_keys = [key for key in data if not key.startswith("__")]
+    for token in priorities:
+        for key in visible_keys:
+            if token in key.lower():
+                array = normalize_signal(np.asarray(data[key]))
+                if array.size > 1000:
+                    return key
+    for key in visible_keys:
+        array = np.asarray(data[key])
+        if np.issubdtype(array.dtype, np.number):
+            signal = normalize_signal(array)
+            if signal.size > 1000:
+                return key
+    return None
+
+
+def load_signal(path: Path, signal_column: str | None) -> tuple[np.ndarray, dict[str, object]]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        return first_numeric_series(pd.read_csv(path), signal_column)
+        return first_numeric_series(pd.read_csv(path), signal_column), {}
     if suffix == ".txt":
         try:
-            return first_numeric_series(pd.read_csv(path, sep=None, engine="python"), signal_column)
+            return first_numeric_series(pd.read_csv(path, sep=None, engine="python"), signal_column), {}
         except Exception:
-            return normalize_signal(np.loadtxt(path))
+            return normalize_signal(np.loadtxt(path)), {}
     if suffix == ".npy":
-        return normalize_signal(np.load(path, allow_pickle=False))
+        return normalize_signal(np.load(path, allow_pickle=False)), {}
     if suffix == ".npz":
         archive = np.load(path, allow_pickle=False)
         keys = list(archive.keys())
         if not keys:
             raise ValueError("NPZ archive is empty")
-        return normalize_signal(archive[keys[0]])
+        return normalize_signal(archive[keys[0]]), {"signal_key": keys[0]}
     if suffix == ".mat":
         data = loadmat(path)
-        preferred = [
-            "signal",
-            "vibration",
-            "data",
-            "X",
-            "x",
-            "DE_time",
-            "FE_time",
-        ]
-        for key in preferred:
-            if key in data:
-                return normalize_signal(data[key])
-        for key, value in data.items():
-            if key.startswith("__"):
-                continue
-            arr = np.asarray(value)
-            if np.issubdtype(arr.dtype, np.number):
-                return normalize_signal(arr)
-        raise ValueError("No numeric MAT array found")
+        signal_key = pick_mat_signal_key(data)
+        if signal_key is None:
+            raise ValueError("No numeric MAT array found")
+        rpm_key = next((key for key in data if key.endswith("RPM")), None)
+        metadata: dict[str, object] = {"signal_key": signal_key}
+        if rpm_key is not None:
+            metadata["rpm"] = float(np.asarray(data[rpm_key]).reshape(-1)[0])
+        return normalize_signal(data[signal_key]), metadata
     if suffix == ".wav":
         _, signal = wavfile.read(path)
-        return normalize_signal(signal)
+        return normalize_signal(signal), {}
     raise ValueError(f"Unsupported file type: {suffix}")
 
 
@@ -138,6 +149,123 @@ def infer_label(path: Path, input_root: Path, strategy: str) -> str:
     return parent if parent else "unlabeled"
 
 
+def infer_bearing_type(path: Path, signal_key: str | None) -> str:
+    text = f"{path} {signal_key or ''}".lower()
+    if "de_time" in text or "drive" in text:
+        return "DRIVE_END"
+    if "fe_time" in text or "fan" in text:
+        return "FAN_END"
+    return "UNKNOWN"
+
+
+def parse_named_cwru_stem(stem: str, path: Path, signal_key: str | None) -> dict[str, object] | None:
+    bearing_type = infer_bearing_type(path, signal_key)
+    normal_match = re.fullmatch(r"Normal_(\d+)", stem, flags=re.IGNORECASE)
+    if normal_match:
+        return {
+            "output_fault_status": "NO_FAULT",
+            "output_bearing_type": "NONE",
+            "output_fault_location": "NONE",
+            "output_fault_diameter_in": 0.0,
+            "output_motor_load_hp": int(normal_match.group(1)),
+            "output_outer_race_position": "NONE",
+        }
+
+    fault_match = re.fullmatch(r"(IR|OR|B)(\d{3})(?:@(\d+))?_(\d+)", stem, flags=re.IGNORECASE)
+    if not fault_match:
+        return None
+
+    location_code = fault_match.group(1).upper()
+    diameter_code = fault_match.group(2)
+    outer_position = fault_match.group(3)
+    load_hp = int(fault_match.group(4))
+    location_map = {"IR": "INNER_RACE", "OR": "OUTER_RACE", "B": "BALL"}
+    return {
+        "output_fault_status": "FAULT",
+        "output_bearing_type": bearing_type,
+        "output_fault_location": location_map[location_code],
+        "output_fault_diameter_in": float(f"0.{diameter_code}"),
+        "output_motor_load_hp": load_hp,
+        "output_outer_race_position": f"@{outer_position}:00" if outer_position else "NONE",
+    }
+
+
+def parse_numeric_cwru_id(stem: str, path: Path, signal_key: str | None) -> dict[str, object] | None:
+    if not stem.isdigit():
+        return None
+    file_id = int(stem)
+    bearing_type = infer_bearing_type(path, signal_key)
+    blocks = [
+        (97, 100, "NO_FAULT", "NONE", 0.0, "NONE"),
+        (105, 108, "FAULT", "INNER_RACE", 0.007, "NONE"),
+        (118, 121, "FAULT", "BALL", 0.007, "NONE"),
+        (130, 133, "FAULT", "OUTER_RACE", 0.007, "@6:00"),
+        (169, 172, "FAULT", "INNER_RACE", 0.014, "NONE"),
+        (185, 188, "FAULT", "BALL", 0.014, "NONE"),
+        (197, 200, "FAULT", "OUTER_RACE", 0.014, "@6:00"),
+        (209, 212, "FAULT", "INNER_RACE", 0.021, "NONE"),
+        (222, 225, "FAULT", "BALL", 0.021, "NONE"),
+        (234, 237, "FAULT", "OUTER_RACE", 0.021, "@6:00"),
+        (246, 249, "FAULT", "INNER_RACE", 0.028, "NONE"),
+        (3005, 3008, "FAULT", "BALL", 0.028, "NONE"),
+    ]
+    for start, end, fault_status, fault_location, diameter, outer_position in blocks:
+        if start <= file_id <= end:
+            return {
+                "output_fault_status": fault_status,
+                "output_bearing_type": "NONE" if fault_status == "NO_FAULT" else bearing_type,
+                "output_fault_location": fault_location,
+                "output_fault_diameter_in": diameter,
+                "output_motor_load_hp": file_id - start,
+                "output_outer_race_position": outer_position,
+            }
+    return None
+
+
+def infer_outputs(path: Path, label: str, signal_key: str | None) -> dict[str, object]:
+    stem = path.stem
+    outputs = parse_named_cwru_stem(stem, path, signal_key) or parse_numeric_cwru_id(stem, path, signal_key)
+    if outputs is not None:
+        return outputs
+
+    label_lower = label.lower()
+    if label_lower in {"healthy", "normal"}:
+        return {
+            "output_fault_status": "NO_FAULT",
+            "output_bearing_type": "NONE",
+            "output_fault_location": "NONE",
+            "output_fault_diameter_in": 0.0,
+            "output_motor_load_hp": np.nan,
+            "output_outer_race_position": "NONE",
+        }
+
+    location_map = {
+        "inner": "INNER_RACE",
+        "outer": "OUTER_RACE",
+        "ball": "BALL",
+        "cage": "CAGE",
+    }
+    return {
+        "output_fault_status": "FAULT" if label_lower in location_map else "UNKNOWN",
+        "output_bearing_type": infer_bearing_type(path, signal_key),
+        "output_fault_location": location_map.get(label_lower, "UNKNOWN"),
+        "output_fault_diameter_in": np.nan,
+        "output_motor_load_hp": np.nan,
+        "output_outer_race_position": "NONE",
+    }
+
+
+def infer_rpm(source_metadata: dict[str, object], outputs: dict[str, object]) -> float:
+    rpm = source_metadata.get("rpm")
+    if rpm is not None and not np.isnan(rpm):
+        return float(rpm)
+    load_hp = outputs.get("output_motor_load_hp")
+    approximate_rpm_by_load = {0: 1797.0, 1: 1772.0, 2: 1750.0, 3: 1730.0}
+    if load_hp in approximate_rpm_by_load:
+        return approximate_rpm_by_load[int(load_hp)]
+    return np.nan
+
+
 def iter_signal_files(input_root: Path) -> Iterable[Path]:
     if input_root.is_file() and input_root.suffix.lower() in SUPPORTED_EXTENSIONS:
         yield input_root
@@ -154,7 +282,7 @@ def load_records(config: dict) -> list[SignalRecord]:
     records: list[SignalRecord] = []
     for path in iter_signal_files(input_root):
         try:
-            signal = load_signal(path, signal_column)
+            signal, source_metadata = load_signal(path, signal_column)
         except Exception as exc:
             print(f"Skipping {path}: {exc}")
             continue
@@ -162,7 +290,8 @@ def load_records(config: dict) -> list[SignalRecord]:
             print(f"Skipping {path}: empty signal")
             continue
         label = infer_label(path, input_root, strategy)
-        records.append(SignalRecord(path=path, label=label, signal=signal))
+        source_metadata["outputs"] = infer_outputs(path, label, source_metadata.get("signal_key"))
+        records.append(SignalRecord(path=path, label=label, signal=signal, source_metadata=source_metadata))
     return records
 
 
@@ -230,6 +359,16 @@ def band_energy(freqs: np.ndarray, power: np.ndarray, low_hz: float, high_hz: fl
     return float(np.sum(power[mask]))
 
 
+def psd_band_energy(freqs: np.ndarray, density: np.ndarray, low_hz: float, high_hz: float | None) -> float:
+    if high_hz is None:
+        mask = freqs >= low_hz
+    else:
+        mask = (freqs >= low_hz) & (freqs < high_hz)
+    if not np.any(mask):
+        return 0.0
+    return float(np.trapezoid(density[mask], freqs[mask]))
+
+
 def dominant_frequency(freqs: np.ndarray, amplitudes: np.ndarray) -> float:
     if amplitudes.size <= 1:
         return 0.0
@@ -242,6 +381,36 @@ def amplitude_near(freqs: np.ndarray, amplitudes: np.ndarray, target_hz: float, 
     if not np.any(mask):
         return 0.0
     return float(np.max(amplitudes[mask]))
+
+
+def top_spectrum_peaks(freqs: np.ndarray, amplitudes: np.ndarray, top_n: int = 5) -> dict[str, float]:
+    if amplitudes.size <= 1:
+        return {f"fd_peak{i}_freq_hz": 0.0 for i in range(1, top_n + 1)} | {
+            f"fd_peak{i}_amp": 0.0 for i in range(1, top_n + 1)
+        }
+
+    peak_indices, _ = find_peaks(amplitudes[1:])
+    peak_indices = peak_indices + 1
+    if peak_indices.size == 0:
+        ranked = np.argsort(amplitudes[1:])[::-1][:top_n] + 1
+    else:
+        ranked = peak_indices[np.argsort(amplitudes[peak_indices])[::-1][:top_n]]
+
+    if ranked.size < top_n:
+        existing = set(int(index) for index in ranked.tolist())
+        for index in (np.argsort(amplitudes[1:])[::-1] + 1).tolist():
+            if int(index) not in existing:
+                ranked = np.append(ranked, index)
+                existing.add(int(index))
+            if ranked.size >= top_n:
+                break
+
+    ranked = ranked[:top_n]
+    features: dict[str, float] = {}
+    for peak_number, index in enumerate(ranked, start=1):
+        features[f"fd_peak{peak_number}_freq_hz"] = float(freqs[int(index)])
+        features[f"fd_peak{peak_number}_amp"] = float(amplitudes[int(index)])
+    return features
 
 
 def compute_fault_frequencies(config: dict) -> dict[str, float]:
@@ -277,6 +446,11 @@ def frequency_domain_features(signal: np.ndarray, sampling_rate_hz: float, confi
     freqs = np.fft.rfftfreq(signal.size, d=1.0 / sampling_rate_hz)
     amplitudes = np.abs(fft) / signal.size
     power = np.square(amplitudes)
+    welch_freqs, welch_density = welch(
+        signal,
+        fs=sampling_rate_hz,
+        nperseg=min(int(config.get("welch_nperseg", 1024)), signal.size),
+    )
 
     analytic = hilbert(signal)
     envelope = np.abs(analytic) - np.mean(np.abs(analytic))
@@ -288,13 +462,20 @@ def frequency_domain_features(signal: np.ndarray, sampling_rate_hz: float, confi
         "fd_dominant_freq_hz": dominant_frequency(freqs, amplitudes),
         "fd_spectral_centroid_hz": centroid,
         "fd_spectral_bandwidth_hz": bandwidth,
-        "fd_total_band_energy": float(np.sum(power)),
+        "fd_total_spectral_energy": float(np.sum(power)),
         "fd_envelope_dominant_freq_hz": dominant_frequency(freqs, envelope_amplitudes),
     }
 
     for low_hz, high_hz in config.get("band_energy_hz", []):
-        key = f"fd_band_energy_{int(low_hz)}_{int(high_hz)}_hz"
-        features[key] = band_energy(freqs, power, float(low_hz), float(high_hz))
+        low_value = float(low_hz)
+        high_value = None if high_hz is None else float(high_hz)
+        if high_value is None:
+            key = f"fd_band_energy_{int(low_value)}_plus_hz"
+        else:
+            key = f"fd_band_energy_{int(low_value)}_{int(high_value)}_hz"
+        features[key] = psd_band_energy(welch_freqs, welch_density, low_value, high_value)
+
+    features.update(top_spectrum_peaks(freqs, amplitudes, top_n=5))
 
     fault_freqs = compute_fault_frequencies(config)
     half_width_hz = float(config.get("fault_band_half_width_hz", 5.0))
@@ -311,6 +492,95 @@ def frequency_domain_features(signal: np.ndarray, sampling_rate_hz: float, confi
             )
 
     return features
+
+
+def stft_summary_features(signal: np.ndarray, sampling_rate_hz: float, config: dict) -> tuple[dict[str, float], pd.DataFrame]:
+    stft_nperseg = min(int(config.get("stft_nperseg", 256)), signal.size)
+    stft_noverlap = min(int(config.get("stft_noverlap", 128)), max(0, stft_nperseg - 1))
+    freqs, times, zxx = stft(
+        signal,
+        fs=sampling_rate_hz,
+        nperseg=stft_nperseg,
+        noverlap=stft_noverlap,
+        boundary=None,
+    )
+    magnitude = np.abs(zxx)
+    power = magnitude**2
+    energy_over_time = np.sum(power, axis=0)
+    max_freq_indices = np.argmax(magnitude, axis=0) if magnitude.size else np.array([], dtype=int)
+    max_freq_over_time = freqs[max_freq_indices] if max_freq_indices.size else np.array([], dtype=float)
+
+    if times.size > 1:
+        energy_slope = float(np.polyfit(times, energy_over_time, 1)[0])
+        max_freq_slope = float(np.polyfit(times, max_freq_over_time, 1)[0])
+    else:
+        energy_slope = 0.0
+        max_freq_slope = 0.0
+
+    features = {
+        "tf_stft_energy_mean": float(np.mean(energy_over_time)) if energy_over_time.size else 0.0,
+        "tf_stft_energy_std": float(np.std(energy_over_time)) if energy_over_time.size else 0.0,
+        "tf_stft_energy_max": float(np.max(energy_over_time)) if energy_over_time.size else 0.0,
+        "tf_stft_energy_min": float(np.min(energy_over_time)) if energy_over_time.size else 0.0,
+        "tf_stft_energy_slope": energy_slope,
+        "tf_stft_max_freq_mean_hz": float(np.mean(max_freq_over_time)) if max_freq_over_time.size else 0.0,
+        "tf_stft_max_freq_std_hz": float(np.std(max_freq_over_time)) if max_freq_over_time.size else 0.0,
+        "tf_stft_max_freq_max_hz": float(np.max(max_freq_over_time)) if max_freq_over_time.size else 0.0,
+        "tf_stft_max_freq_min_hz": float(np.min(max_freq_over_time)) if max_freq_over_time.size else 0.0,
+        "tf_stft_max_freq_slope_hz_per_s": max_freq_slope,
+    }
+    series_df = pd.DataFrame(
+        {
+            "time_sec": times,
+            "stft_energy": energy_over_time,
+            "stft_max_freq_hz": max_freq_over_time,
+        }
+    )
+    return features, series_df
+
+
+def save_stft_artifacts(
+    output_dir: Path,
+    label: str,
+    file_stem: str,
+    segment_index: int,
+    signal: np.ndarray,
+    sampling_rate_hz: float,
+    config: dict,
+    series_df: pd.DataFrame,
+) -> tuple[str, str]:
+    stft_dir = output_dir / "stft"
+    plot_dir = stft_dir / "plots" / label
+    series_dir = stft_dir / "series" / label
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = f"{file_stem}_segment_{segment_index}"
+    series_path = series_dir / f"{stem}_stft_series.csv"
+    series_df.to_csv(series_path, index=False)
+
+    stft_nperseg = min(int(config.get("stft_nperseg", 256)), signal.size)
+    stft_noverlap = min(int(config.get("stft_noverlap", 128)), max(0, stft_nperseg - 1))
+    freqs, times, zxx = stft(
+        signal,
+        fs=sampling_rate_hz,
+        nperseg=stft_nperseg,
+        noverlap=stft_noverlap,
+        boundary=None,
+    )
+    magnitude = np.abs(zxx)
+
+    plt.figure(figsize=(10, 4))
+    plt.pcolormesh(times, freqs, magnitude, shading="gouraud")
+    plt.title(f"STFT Magnitude - {label}")
+    plt.ylabel("Frequency [Hz]")
+    plt.xlabel("Time [s]")
+    plt.colorbar(label="Magnitude")
+    plt.tight_layout()
+    plot_path = plot_dir / f"{stem}_stft.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    return str(plot_path), str(series_path)
 
 
 def save_plot(
@@ -371,6 +641,7 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     segment_overlap = float(config.get("segment_overlap", 0.5))
     output_rows = []
     plots_per_label: dict[str, int] = {}
+    stft_artifacts_per_file: dict[str, int] = {}
     output_dir = Path(config["output_dir"]).expanduser().resolve()
 
     for record in records:
@@ -379,13 +650,38 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             metadata = {
                 "label": record.label,
                 "source_file": str(record.path),
+                "source_basename": record.path.name,
                 "segment_index": segment_index,
                 "start_sample": start,
                 "end_sample": start + segment_length,
+                "signal_key": record.source_metadata.get("signal_key", ""),
+                **record.source_metadata.get("outputs", {}),
             }
+            metadata["rpm"] = infer_rpm(record.source_metadata, record.source_metadata.get("outputs", {}))
             td = time_domain_features(segment)
             fd = frequency_domain_features(segment, sampling_rate_hz, config)
-            row = metadata | td | fd
+            tf, stft_series_df = stft_summary_features(segment, sampling_rate_hz, config)
+            row = metadata | td | fd | tf
+
+            row["tf_stft_plot_path"] = "NOT_SAVED"
+            row["tf_stft_series_path"] = "NOT_SAVED"
+            if config.get("save_stft_artifacts", True):
+                saved_count = stft_artifacts_per_file.get(str(record.path), 0)
+                if saved_count < int(config.get("max_stft_artifacts_per_file", 1)):
+                    plot_path, series_path = save_stft_artifacts(
+                        output_dir=output_dir,
+                        label=record.label,
+                        file_stem=record.path.stem,
+                        segment_index=segment_index,
+                        signal=segment,
+                        sampling_rate_hz=sampling_rate_hz,
+                        config=config,
+                        series_df=stft_series_df,
+                    )
+                    row["tf_stft_plot_path"] = plot_path
+                    row["tf_stft_series_path"] = series_path
+                    stft_artifacts_per_file[str(record.path)] = saved_count + 1
+
             output_rows.append(row)
 
             if plots_per_label.get(record.label, 0) < int(config.get("max_plots_per_label", 1)):
@@ -401,19 +697,48 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                 plots_per_label[record.label] = plots_per_label.get(record.label, 0) + 1
 
     combined = pd.DataFrame(output_rows)
-    metadata_cols = ["label", "source_file", "segment_index", "start_sample", "end_sample"]
+    metadata_cols = [
+        "label",
+        "source_file",
+        "source_basename",
+        "segment_index",
+        "start_sample",
+        "end_sample",
+        "signal_key",
+        "rpm",
+        "output_fault_status",
+        "output_bearing_type",
+        "output_fault_location",
+        "output_fault_diameter_in",
+        "output_motor_load_hp",
+        "output_outer_race_position",
+        "tf_stft_plot_path",
+        "tf_stft_series_path",
+    ]
     time_cols = metadata_cols + [column for column in combined.columns if column.startswith("td_")]
     freq_cols = metadata_cols + [column for column in combined.columns if column.startswith("fd_")]
-    return combined, combined[time_cols], combined[freq_cols]
+    tf_cols = metadata_cols + [column for column in combined.columns if column.startswith("tf_")]
+    metadata_df = combined[metadata_cols]
+    return metadata_df, combined, combined[time_cols], combined[freq_cols], combined[tf_cols]
 
 
-def save_outputs(config: dict, combined: pd.DataFrame, time_df: pd.DataFrame, freq_df: pd.DataFrame) -> None:
+def save_outputs(
+    config: dict,
+    metadata_df: pd.DataFrame,
+    combined: pd.DataFrame,
+    time_df: pd.DataFrame,
+    freq_df: pd.DataFrame,
+    tf_df: pd.DataFrame,
+) -> None:
     output_dir = Path(config["output_dir"]).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    metadata_df.to_csv(output_dir / "metadata_outputs.csv", index=False)
     combined.to_csv(output_dir / "combined_features.csv", index=False)
+    combined.to_csv(output_dir / "combined_features_with_outputs.csv", index=False)
     time_df.to_csv(output_dir / "time_domain_features.csv", index=False)
     freq_df.to_csv(output_dir / "frequency_domain_features.csv", index=False)
+    tf_df.to_csv(output_dir / "time_frequency_features.csv", index=False)
 
     summary = {
         "config_path": config.get("_config_path"),
@@ -427,7 +752,10 @@ def save_outputs(config: dict, combined: pd.DataFrame, time_df: pd.DataFrame, fr
         "labels": sorted(combined["label"].dropna().astype(str).unique().tolist()),
         "num_time_features": int(len([c for c in combined.columns if c.startswith("td_")])),
         "num_frequency_features": int(len([c for c in combined.columns if c.startswith("fd_")])),
+        "num_time_frequency_features": int(len([c for c in combined.columns if c.startswith("tf_")])),
         "has_missing_values": bool(combined.isna().any().any()),
+        "output_fault_status_counts": combined["output_fault_status"].value_counts(dropna=False).to_dict(),
+        "output_fault_location_counts": combined["output_fault_location"].value_counts(dropna=False).to_dict(),
     }
     with (output_dir / "run_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -448,8 +776,8 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     config["_config_path"] = str(args.config.resolve())
-    combined, time_df, freq_df = build_feature_tables(config)
-    save_outputs(config, combined, time_df, freq_df)
+    metadata_df, combined, time_df, freq_df, tf_df = build_feature_tables(config)
+    save_outputs(config, metadata_df, combined, time_df, freq_df, tf_df)
     print(f"Saved {len(combined)} segments to {config['output_dir']}")
     return 0
 

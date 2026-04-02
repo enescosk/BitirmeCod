@@ -17,8 +17,11 @@
   "fault_band_half_width_hz": 5.0,
   "band_energy_hz": [
     [0, 500],
-    [500, 1500],
-    [1500, 3000]
+    [500, 2000],
+    [2000, null]
   ],
+  "welch_nperseg": 1024,
+  "stft_nperseg": 256,
+  "stft_noverlap": 128,
   "max_plots_per_label": 1
 }

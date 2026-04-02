@@ -19,6 +19,17 @@
     "outer"
   ],
   "num_time_features": 14,
-  "num_frequency_features": 36,
-  "has_missing_values": false
+  "num_frequency_features": 46,
+  "num_time_frequency_features": 12,
+  "has_missing_values": false,
+  "output_fault_status_counts": {
+    "FAULT": 353,
+    "NO_FAULT": 237
+  },
+  "output_fault_location_counts": {
+    "NONE": 237,
+    "BALL": 118,
+    "OUTER_RACE": 118,
+    "INNER_RACE": 117
+  }
 }

@@ -1,0 +1,29 @@
+{
+  "input_dir": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/data/cwru_database_20260329",
+  "output_dir": "/Users/ec/Desktop/automation/hidayet/BitirmeCod/outputs/cwru_database_run",
+  "sampling_rate_hz": 12000,
+  "segment_length": 2048,
+  "segment_overlap": 0.5,
+  "label_strategy": "parent_dir",
+  "signal_column": null,
+  "shaft_frequency_hz": 29.95,
+  "fault_frequencies_hz": {
+    "BPFI": 162.19,
+    "BPFO": 107.36,
+    "BSF": 141.17,
+    "FTF": 11.93
+  },
+  "harmonics": 3,
+  "fault_band_half_width_hz": 5.0,
+  "band_energy_hz": [
+    [0, 500],
+    [500, 2000],
+    [2000, null]
+  ],
+  "welch_nperseg": 1024,
+  "stft_nperseg": 256,
+  "stft_noverlap": 128,
+  "max_plots_per_label": 1,
+  "save_stft_artifacts": true,
+  "max_stft_artifacts_per_file": 1
+}

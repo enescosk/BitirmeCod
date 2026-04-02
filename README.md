@@ -32,12 +32,19 @@ Time-domain:
 Frequency-domain:
 
 - dominant frequency
+- top 5 spectrum peak frequencies and amplitudes
 - spectral centroid
 - spectral bandwidth
 - total spectral energy
 - envelope-spectrum dominant frequency
-- configurable band energies
+- configurable band energies (`0-500 Hz`, `500-2000 Hz`, `2000+ Hz`)
 - amplitudes near `BPFI`, `BPFO`, `BSF`, `FTF` and their harmonics in both FFT and envelope spectrum
+
+Time-frequency:
+
+- STFT energy statistics over time
+- STFT max-frequency statistics over time
+- optional saved STFT plots and time-series CSV artifacts
 
 ## Supported input formats
 
@@ -94,11 +101,16 @@ python3 scripts/extract_features.py --config path/to/your_config.json
 
 The script writes:
 
+- `metadata_outputs.csv`
 - `combined_features.csv`
+- `combined_features_with_outputs.csv`
 - `time_domain_features.csv`
 - `frequency_domain_features.csv`
+- `time_frequency_features.csv`
 - `run_summary.json`
 - `plots/<label>/*.png`
+- `stft/plots/<label>/*.png`
+- `stft/series/<label>/*.csv`
 
 ## Notes
 
