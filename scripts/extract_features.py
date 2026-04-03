@@ -28,6 +28,7 @@ from scipy.stats import kurtosis, skew
 
 
 SUPPORTED_EXTENSIONS = {".csv", ".txt", ".npy", ".npz", ".mat", ".wav"}
+DEFAULT_MAT_PRIORITIES = ["de_time", "fe_time", "ba_time", "signal", "vibration", "data", "x"]
 
 
 @dataclass
@@ -57,6 +58,7 @@ def load_config(path: Path) -> dict:
     config.setdefault("stft_nperseg", 256)
     config.setdefault("stft_noverlap", 128)
     config.setdefault("welch_nperseg", 1024)
+    config.setdefault("infer_sampling_rate", False)
     return config
 
 
@@ -83,8 +85,27 @@ def first_numeric_series(frame: pd.DataFrame, requested_column: str | None) -> n
     return normalize_signal(numeric.iloc[:, 0].to_numpy())
 
 
-def pick_mat_signal_key(data: dict[str, object]) -> str | None:
-    priorities = ["de_time", "fe_time", "ba_time", "signal", "vibration", "data", "x"]
+def preferred_mat_priorities(path: Path) -> list[str]:
+    path_text = str(path).lower()
+    if "fan" in path_text:
+        return ["fe_time", "de_time", "ba_time", "signal", "vibration", "data", "x"]
+    if "drive" in path_text or "48k" in path_text:
+        return DEFAULT_MAT_PRIORITIES.copy()
+
+    file_id = extract_numeric_file_id(path)
+    fan_end_ids = (
+        set(range(270, 303))
+        | {305, 306, 307}
+        | set(range(309, 314))
+        | {315, 316, 317, 318}
+    )
+    if file_id in fan_end_ids:
+        return ["fe_time", "de_time", "ba_time", "signal", "vibration", "data", "x"]
+    return DEFAULT_MAT_PRIORITIES.copy()
+
+
+def pick_mat_signal_key(data: dict[str, object], priorities: list[str] | None = None) -> str | None:
+    priorities = priorities or DEFAULT_MAT_PRIORITIES
     visible_keys = [key for key in data if not key.startswith("__")]
     for token in priorities:
         for key in visible_keys:
@@ -120,11 +141,15 @@ def load_signal(path: Path, signal_column: str | None) -> tuple[np.ndarray, dict
         return normalize_signal(archive[keys[0]]), {"signal_key": keys[0]}
     if suffix == ".mat":
         data = loadmat(path)
-        signal_key = pick_mat_signal_key(data)
+        mat_priorities = preferred_mat_priorities(path)
+        if signal_column and signal_column in data:
+            signal_key = signal_column
+        else:
+            signal_key = pick_mat_signal_key(data, priorities=mat_priorities)
         if signal_key is None:
             raise ValueError("No numeric MAT array found")
         rpm_key = next((key for key in data if key.endswith("RPM")), None)
-        metadata: dict[str, object] = {"signal_key": signal_key}
+        metadata: dict[str, object] = {"signal_key": signal_key, "mat_priorities": mat_priorities}
         if rpm_key is not None:
             metadata["rpm"] = float(np.asarray(data[rpm_key]).reshape(-1)[0])
         return normalize_signal(data[signal_key]), metadata
@@ -156,6 +181,10 @@ def infer_bearing_type(path: Path, signal_key: str | None) -> str:
     if "fe_time" in text or "fan" in text:
         return "FAN_END"
     return "UNKNOWN"
+
+
+def extract_numeric_file_id(path: Path) -> int | None:
+    return int(path.stem) if path.stem.isdigit() else None
 
 
 def parse_named_cwru_stem(stem: str, path: Path, signal_key: str | None) -> dict[str, object] | None:
@@ -222,9 +251,73 @@ def parse_numeric_cwru_id(stem: str, path: Path, signal_key: str | None) -> dict
     return None
 
 
+def parse_extended_cwru_id(path: Path, signal_key: str | None) -> dict[str, object] | None:
+    file_id = extract_numeric_file_id(path)
+    if file_id is None:
+        return None
+
+    bearing_type = infer_bearing_type(path, signal_key)
+    mappings: list[tuple[set[int], str, str, float, str, dict[int, int] | None]] = [
+        (set(range(97, 101)), "NO_FAULT", "NONE", 0.0, "NONE", {97: 0, 98: 1, 99: 2, 100: 3}),
+        (set(range(105, 109)), "FAULT", "INNER_RACE", 0.007, "NONE", {105: 0, 106: 1, 107: 2, 108: 3}),
+        (set(range(109, 113)), "FAULT", "INNER_RACE", 0.007, "NONE", {109: 0, 110: 1, 111: 2, 112: 3}),
+        (set(range(118, 122)), "FAULT", "BALL", 0.007, "NONE", {118: 0, 119: 1, 120: 2, 121: 3}),
+        (set(range(122, 126)), "FAULT", "BALL", 0.007, "NONE", {122: 0, 123: 1, 124: 2, 125: 3}),
+        (set(range(130, 134)), "FAULT", "OUTER_RACE", 0.007, "@6:00", {130: 0, 131: 1, 132: 2, 133: 3}),
+        (set(range(135, 139)), "FAULT", "OUTER_RACE", 0.007, "@6:00", {135: 0, 136: 1, 137: 2, 138: 3}),
+        (set(range(148, 152)), "FAULT", "OUTER_RACE", 0.007, "@3:00", {148: 0, 149: 1, 150: 2, 151: 3}),
+        (set(range(161, 165)), "FAULT", "OUTER_RACE", 0.007, "@12:00", {161: 0, 162: 1, 163: 2, 164: 3}),
+        (set(range(169, 173)), "FAULT", "INNER_RACE", 0.014, "NONE", {169: 0, 170: 1, 171: 2, 172: 3}),
+        (set(range(174, 178)), "FAULT", "INNER_RACE", 0.014, "NONE", {174: 0, 175: 1, 176: 2, 177: 3}),
+        (set(range(185, 189)), "FAULT", "BALL", 0.014, "NONE", {185: 0, 186: 1, 187: 2, 188: 3}),
+        (set(range(189, 193)), "FAULT", "BALL", 0.014, "NONE", {189: 0, 190: 1, 191: 2, 192: 3}),
+        (set(range(197, 201)), "FAULT", "OUTER_RACE", 0.014, "@6:00", {197: 0, 198: 1, 199: 2, 200: 3}),
+        (set(range(201, 205)), "FAULT", "OUTER_RACE", 0.014, "@6:00", {201: 0, 202: 1, 203: 2, 204: 3}),
+        ({209, 210, 211, 212}, "FAULT", "INNER_RACE", 0.021, "NONE", {209: 0, 210: 1, 211: 2, 212: 3}),
+        ({213, 214, 215, 217}, "FAULT", "INNER_RACE", 0.021, "NONE", {213: 0, 214: 1, 215: 2, 217: 3}),
+        ({222, 223, 224, 225}, "FAULT", "BALL", 0.021, "NONE", {222: 0, 223: 1, 224: 2, 225: 3}),
+        ({226, 227, 228, 229}, "FAULT", "BALL", 0.021, "NONE", {226: 0, 227: 1, 228: 2, 229: 3}),
+        ({234, 235, 236, 237}, "FAULT", "OUTER_RACE", 0.021, "@6:00", {234: 0, 235: 1, 236: 2, 237: 3}),
+        ({238, 239, 240, 241}, "FAULT", "OUTER_RACE", 0.021, "@6:00", {238: 0, 239: 1, 240: 2, 241: 3}),
+        ({246, 247, 248, 249}, "FAULT", "INNER_RACE", 0.028, "NONE", {246: 0, 247: 1, 248: 2, 249: 3}),
+        ({250, 251, 252, 253}, "FAULT", "OUTER_RACE", 0.021, "@3:00", {250: 0, 251: 1, 252: 2, 253: 3}),
+        ({262, 263, 264, 265}, "FAULT", "OUTER_RACE", 0.021, "@12:00", {262: 0, 263: 1, 264: 2, 265: 3}),
+        ({270, 271, 272, 273}, "FAULT", "INNER_RACE", 0.021, "NONE", {270: 0, 271: 1, 272: 2, 273: 3}),
+        ({274, 275, 276, 277}, "FAULT", "INNER_RACE", 0.014, "NONE", {274: 0, 275: 1, 276: 2, 277: 3}),
+        ({278, 279, 280, 281}, "FAULT", "INNER_RACE", 0.007, "NONE", {278: 0, 279: 1, 280: 2, 281: 3}),
+        ({282, 283, 284, 285}, "FAULT", "BALL", 0.007, "NONE", {282: 0, 283: 1, 284: 2, 285: 3}),
+        ({286, 287, 288, 289}, "FAULT", "BALL", 0.014, "NONE", {286: 0, 287: 1, 288: 2, 289: 3}),
+        ({290, 291, 292, 293}, "FAULT", "BALL", 0.021, "NONE", {290: 0, 291: 1, 292: 2, 293: 3}),
+        ({294, 295, 296, 297}, "FAULT", "OUTER_RACE", 0.007, "@6:00", {294: 0, 295: 1, 296: 2, 297: 3}),
+        ({298, 299, 300, 301}, "FAULT", "OUTER_RACE", 0.007, "@3:00", {298: 0, 299: 1, 300: 2, 301: 3}),
+        ({302, 305, 306, 307}, "FAULT", "OUTER_RACE", 0.007, "@12:00", {302: 0, 305: 1, 306: 2, 307: 3}),
+        ({309, 310, 311, 312}, "FAULT", "OUTER_RACE", 0.014, "@3:00", {310: 0, 309: 1, 311: 2, 312: 3}),
+        ({313}, "FAULT", "OUTER_RACE", 0.014, "@6:00", {313: 0}),
+        ({315}, "FAULT", "OUTER_RACE", 0.021, "@6:00", {315: 0}),
+        ({316, 317, 318}, "FAULT", "OUTER_RACE", 0.021, "@3:00", {316: 1, 317: 2, 318: 3}),
+        ({3005, 3006, 3007, 3008}, "FAULT", "BALL", 0.028, "NONE", {3005: 0, 3006: 1, 3007: 2, 3008: 3}),
+    ]
+
+    for file_ids, fault_status, fault_location, diameter, outer_position, load_map in mappings:
+        if file_id in file_ids:
+            return {
+                "output_fault_status": fault_status,
+                "output_bearing_type": "NONE" if fault_status == "NO_FAULT" else bearing_type,
+                "output_fault_location": fault_location,
+                "output_fault_diameter_in": diameter,
+                "output_motor_load_hp": load_map[file_id] if load_map else np.nan,
+                "output_outer_race_position": outer_position,
+            }
+    return None
+
+
 def infer_outputs(path: Path, label: str, signal_key: str | None) -> dict[str, object]:
     stem = path.stem
-    outputs = parse_named_cwru_stem(stem, path, signal_key) or parse_numeric_cwru_id(stem, path, signal_key)
+    outputs = (
+        parse_named_cwru_stem(stem, path, signal_key)
+        or parse_extended_cwru_id(path, signal_key)
+        or parse_numeric_cwru_id(stem, path, signal_key)
+    )
     if outputs is not None:
         return outputs
 
@@ -264,6 +357,46 @@ def infer_rpm(source_metadata: dict[str, object], outputs: dict[str, object]) ->
     if load_hp in approximate_rpm_by_load:
         return approximate_rpm_by_load[int(load_hp)]
     return np.nan
+
+
+def infer_sampling_rate(path: Path, default_sampling_rate_hz: float) -> float:
+    path_text = str(path).lower()
+    if "48k" in path_text or "48000" in path_text:
+        return 48000.0
+    file_id = extract_numeric_file_id(path)
+    if file_id is None:
+        return float(default_sampling_rate_hz)
+    forty_eight_k_ids = (
+        set(range(109, 113))
+        | set(range(122, 126))
+        | set(range(135, 139))
+        | set(range(148, 152))
+        | set(range(161, 165))
+        | set(range(174, 178))
+        | set(range(189, 193))
+        | set(range(201, 205))
+        | {213, 214, 215, 217}
+        | {226, 227, 228, 229}
+        | {238, 239, 240, 241}
+        | {250, 251, 252, 253}
+        | {262, 263, 264, 265}
+    )
+    if file_id in forty_eight_k_ids:
+        return 48000.0
+    return float(default_sampling_rate_hz)
+
+
+def derive_class_label(outputs: dict[str, object], fallback_label: str) -> str:
+    if outputs.get("output_fault_status") == "NO_FAULT":
+        return "healthy"
+    location = outputs.get("output_fault_location")
+    mapping = {
+        "INNER_RACE": "inner_race",
+        "OUTER_RACE": "outer_race",
+        "BALL": "ball",
+        "CAGE": "cage",
+    }
+    return mapping.get(location, fallback_label)
 
 
 def iter_signal_files(input_root: Path) -> Iterable[Path]:
@@ -636,7 +769,7 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             "No supported signal files found. Put dataset files under input_dir or update the config."
         )
 
-    sampling_rate_hz = float(config["sampling_rate_hz"])
+    default_sampling_rate_hz = float(config["sampling_rate_hz"])
     segment_length = int(config["segment_length"])
     segment_overlap = float(config.get("segment_overlap", 0.5))
     output_rows = []
@@ -645,19 +778,27 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     output_dir = Path(config["output_dir"]).expanduser().resolve()
 
     for record in records:
+        outputs = record.source_metadata.get("outputs", {})
+        class_label = derive_class_label(outputs, record.label)
+        sampling_rate_hz = (
+            infer_sampling_rate(record.path, default_sampling_rate_hz)
+            if config.get("infer_sampling_rate", False)
+            else default_sampling_rate_hz
+        )
         segments = segment_signal(record.signal, segment_length, segment_overlap)
         for segment_index, (start, segment) in enumerate(segments):
             metadata = {
-                "label": record.label,
+                "label": class_label,
                 "source_file": str(record.path),
                 "source_basename": record.path.name,
                 "segment_index": segment_index,
                 "start_sample": start,
                 "end_sample": start + segment_length,
                 "signal_key": record.source_metadata.get("signal_key", ""),
-                **record.source_metadata.get("outputs", {}),
+                "sampling_rate_hz": sampling_rate_hz,
+                **outputs,
             }
-            metadata["rpm"] = infer_rpm(record.source_metadata, record.source_metadata.get("outputs", {}))
+            metadata["rpm"] = infer_rpm(record.source_metadata, outputs)
             td = time_domain_features(segment)
             fd = frequency_domain_features(segment, sampling_rate_hz, config)
             tf, stft_series_df = stft_summary_features(segment, sampling_rate_hz, config)
@@ -670,7 +811,7 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                 if saved_count < int(config.get("max_stft_artifacts_per_file", 1)):
                     plot_path, series_path = save_stft_artifacts(
                         output_dir=output_dir,
-                        label=record.label,
+                        label=class_label,
                         file_stem=record.path.stem,
                         segment_index=segment_index,
                         signal=segment,
@@ -684,17 +825,17 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
 
             output_rows.append(row)
 
-            if plots_per_label.get(record.label, 0) < int(config.get("max_plots_per_label", 1)):
+            if plots_per_label.get(class_label, 0) < int(config.get("max_plots_per_label", 1)):
                 save_plot(
                     output_dir=output_dir,
-                    label=record.label,
+                    label=class_label,
                     file_stem=record.path.stem,
                     segment_index=segment_index,
                     signal=segment,
                     sampling_rate_hz=sampling_rate_hz,
                     config=config,
                 )
-                plots_per_label[record.label] = plots_per_label.get(record.label, 0) + 1
+                plots_per_label[class_label] = plots_per_label.get(class_label, 0) + 1
 
     combined = pd.DataFrame(output_rows)
     metadata_cols = [
@@ -705,6 +846,7 @@ def build_feature_tables(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
         "start_sample",
         "end_sample",
         "signal_key",
+        "sampling_rate_hz",
         "rpm",
         "output_fault_status",
         "output_bearing_type",
@@ -745,6 +887,7 @@ def save_outputs(
         "input_dir": config["input_dir"],
         "output_dir": str(output_dir),
         "sampling_rate_hz": config["sampling_rate_hz"],
+        "infer_sampling_rate": bool(config.get("infer_sampling_rate", False)),
         "segment_length": config["segment_length"],
         "segment_overlap": config.get("segment_overlap", 0.5),
         "fault_frequencies_hz": compute_fault_frequencies(config),
@@ -754,8 +897,10 @@ def save_outputs(
         "num_frequency_features": int(len([c for c in combined.columns if c.startswith("fd_")])),
         "num_time_frequency_features": int(len([c for c in combined.columns if c.startswith("tf_")])),
         "has_missing_values": bool(combined.isna().any().any()),
+        "sampling_rate_counts_hz": combined["sampling_rate_hz"].value_counts(dropna=False).to_dict(),
         "output_fault_status_counts": combined["output_fault_status"].value_counts(dropna=False).to_dict(),
         "output_fault_location_counts": combined["output_fault_location"].value_counts(dropna=False).to_dict(),
+        "output_bearing_type_counts": combined["output_bearing_type"].value_counts(dropna=False).to_dict(),
     }
     with (output_dir / "run_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
