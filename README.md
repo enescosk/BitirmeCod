@@ -5,10 +5,12 @@ This repository now includes a working feature-extraction pipeline for bearing o
 ## Included files
 
 - `scripts/extract_features.py`: main CLI that extracts time-domain and frequency-domain features.
+- `scripts/train_model.py`: ML baseline runner with feature selection, classical models, and a neural-network baseline.
 - `scripts/generate_demo_data.py`: creates a small synthetic demo dataset for verification.
 - `configs/example_config.json`: template for your real dataset.
 - `configs/demo_config.json`: ready-to-run config for the synthetic demo data.
 - `docs/physical_interpretation.md`: short notes for the meeting.
+- `docs/dataset_candidates.md`: shortlist of candidate public datasets for the next ML stage.
 
 ## Extracted features
 
@@ -97,6 +99,23 @@ Run the pipeline on your real dataset:
 python3 scripts/extract_features.py --config path/to/your_config.json
 ```
 
+Run the ML baseline on an extracted feature table:
+
+```bash
+python3 scripts/train_model.py \
+  --input outputs/cwru_database_run/combined_features_with_outputs.csv \
+  --output outputs/ml_results
+```
+
+Optional: compare different feature subset sizes:
+
+```bash
+python3 scripts/train_model.py \
+  --input outputs/cwru_database_run/combined_features_with_outputs.csv \
+  --output outputs/ml_results \
+  --feature-counts 10,20,all
+```
+
 ## Outputs
 
 The script writes:
@@ -112,8 +131,19 @@ The script writes:
 - `stft/plots/<label>/*.png`
 - `stft/series/<label>/*.csv`
 
+The ML script writes:
+
+- `ml_reports.json`
+- `feature_ranking_<task>.csv`
+- `feature_importance_<task>.png`
+- `selected_features_<task>.json`
+- `accuracy_summary_<task>.csv`
+- `accuracy_comparison_<task>.png`
+- `cm_<task>_<feature_subset>_<model>.png`
+
 ## Notes
 
 - If the dataset documentation already gives `BPFI/BPFO/BSF/FTF`, use those values directly.
 - If not, use the formulas in `docs/physical_interpretation.md` with bearing geometry and shaft speed.
 - Time-frequency features were intentionally left as a second step so the current deliverable stays focused on the meeting requirement.
+- Feature selection in the ML script is computed on the training split only, so the ranking does not leak information from the test split.
